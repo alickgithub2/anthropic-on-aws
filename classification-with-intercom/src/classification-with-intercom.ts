@@ -1,7 +1,7 @@
 import { App, CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { config } from 'dotenv';
-import { LambdaResources, ApiGatewayResources } from './';
+import { LambdaResources, ApiGatewayResources } from '.';
 config();
 
 interface HostedWhisperStreamingProps extends StackProps {
