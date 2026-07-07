@@ -225,12 +225,24 @@ export class EksCompute extends Construct {
       release: 'csi-secrets-store',
       values: { syncSecret: { enabled: true }, enableSecretRotation: true },
     });
+    // The AWS provider chart bundles the Secrets Store CSI driver as a subchart
+    // that installs BY DEFAULT (secrets-store-csi-driver.install=true). We install
+    // the driver as its OWN release above (for the syncSecret/rotation values), so
+    // leaving the subchart on makes this release try to recreate the driver's
+    // ServiceAccount, ClusterRoles, and the cluster-singleton CSIDriver object —
+    // which the standalone release already owns — and CreateCluster fails with
+    // "already exists". Disable the subchart so this release installs ONLY the AWS
+    // provider daemonset.
     const awsProvider = cluster.addHelmChart('AwsProvider', {
       chart: 'secrets-store-csi-driver-provider-aws',
       repository: 'https://aws.github.io/secrets-store-csi-driver-provider-aws',
       namespace: 'kube-system',
       release: 'secrets-provider-aws',
+      values: { 'secrets-store-csi-driver': { install: false } },
     });
+    // Install the driver first so the shared CRDs/CSIDriver object exist before the
+    // provider release reconciles against them.
+    awsProvider.node.addDependency(csiDriver);
 
     // ── Namespace + ServiceAccount ────────────────────────────────────────────
     const ns = cluster.addManifest('Namespace', {

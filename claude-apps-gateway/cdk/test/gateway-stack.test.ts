@@ -246,6 +246,21 @@ describe('EKS pass 2 (imageReady: true) — workload', () => {
   test('does NOT create any ECS service (exactly one compute path)', () => {
     template.resourceCountIs('AWS::ECS::Service', 0);
   });
+
+  test('AWS provider Helm chart disables its bundled CSI driver subchart', () => {
+    // The secrets-store-csi-driver-provider-aws chart ships the CSI driver as a
+    // subchart that installs by default. We install the driver as its own release,
+    // so the subchart must be OFF or both releases fight over the singleton
+    // CSIDriver object + shared ClusterRoles and CreateCluster fails "already
+    // exists". Values render to a JSON string on the HelmChart custom resource.
+    template.hasResourceProperties(
+      'Custom::AWSCDK-EKS-HelmChart',
+      Match.objectLike({
+        Chart: 'secrets-store-csi-driver-provider-aws',
+        Values: Match.stringLikeRegexp('"secrets-store-csi-driver":\\{"install":false\\}'),
+      }),
+    );
+  });
 });
 
 describe('createVpcEndpoints (VPC reuse)', () => {
