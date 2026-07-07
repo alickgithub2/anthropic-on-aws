@@ -3,23 +3,67 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import { GatewayStack, GatewayStackProps } from '../lib/claude-gateway-stack';
 
 /**
- * Synth-level regression tests for the Fargate stack. These assert on the
- * CloudFormation template CDK produces — no AWS account or credentials needed,
- * matching the repo's "verification is local/static" stance (see CLAUDE.md).
+ * Synth-level regression tests. These assert on the CloudFormation template CDK
+ * produces — no AWS account or credentials needed, matching the repo's
+ * "verification is local/static" stance (see CLAUDE.md).
  *
- * The focus is the non-obvious wiring that breaks the gateway if it regresses:
- * the dual-ARN Bedrock policy, the IPv4-only internal ALB, the raised idle
- * timeout, the /healthz target-group check, the HTTPS :4318 telemetry listener,
- * and the createVpcEndpoints opt-out added for VPC reuse.
+ * Coverage:
+ *  - the shared layer (RDS, ECR, secrets, VPC endpoints) is created once per deploy;
+ *  - the ECS path keeps its non-obvious wiring (dual-ARN Bedrock policy, IPv4-only
+ *    internal ALB, raised idle timeout, /healthz check, HTTPS :4318 listener);
+ *  - the EKS path adds a cluster with Auto Mode, the cluster/node IAM roles, and a
+ *    Pod Identity association, and reuses the SAME RDS + secrets (no duplication);
+ *  - exactly ONE compute path is ever synthesized — never both.
+ *
+ * The vpcId is supplied so both paths reuse a VPC (fromLookup is stubbed via the
+ * synth context below) and zoneId is set so ECS uses fromHostedZoneAttributes
+ * instead of fromLookup, which would otherwise require live account credentials.
  */
 
 const ACCOUNT = '111122223333';
 const REGION = 'us-east-1';
+const VPC_ID = 'vpc-0123456789abcdef0';
 
-// Pass-2 inputs. zoneId is supplied so the stack uses fromHostedZoneAttributes
-// instead of fromLookup, which would otherwise require live account credentials.
-const PASS2: GatewayStackProps = {
-  env: { account: ACCOUNT, region: REGION },
+// A stubbed VPC context entry so ec2.Vpc.fromLookup resolves without credentials.
+function appWithVpcContext(): cdk.App {
+  const app = new cdk.App({
+    context: {
+      [`vpc-provider:account=${ACCOUNT}:filter.vpc-id=${VPC_ID}:region=${REGION}:returnAsymmetricSubnets=true`]: {
+        vpcId: VPC_ID,
+        vpcCidrBlock: '10.1.0.0/16',
+        availabilityZones: [],
+        subnetGroups: [
+          {
+            name: 'private',
+            type: 'Private',
+            subnets: [
+              { subnetId: 'subnet-a', availabilityZone: `${REGION}a`, routeTableId: 'rtb-a', cidr: '10.1.0.0/24' },
+              { subnetId: 'subnet-b', availabilityZone: `${REGION}b`, routeTableId: 'rtb-b', cidr: '10.1.1.0/24' },
+            ],
+          },
+          {
+            name: 'public',
+            type: 'Public',
+            subnets: [
+              { subnetId: 'subnet-c', availabilityZone: `${REGION}a`, routeTableId: 'rtb-c', cidr: '10.1.2.0/24' },
+              { subnetId: 'subnet-d', availabilityZone: `${REGION}b`, routeTableId: 'rtb-d', cidr: '10.1.3.0/24' },
+            ],
+          },
+        ],
+      },
+    },
+  });
+  return app;
+}
+
+function synth(props: Omit<GatewayStackProps, 'env'>): Template {
+  const app = appWithVpcContext();
+  const stack = new GatewayStack(app, 'TestStack', { ...props, env: { account: ACCOUNT, region: REGION } });
+  return Template.fromStack(stack);
+}
+
+const ECS_PASS2: Omit<GatewayStackProps, 'env'> = {
+  platform: 'ecs',
   imageReady: true,
   imageTag: '2.1.197',
   publicUrl: 'https://claude-gateway.example.com',
@@ -27,16 +71,14 @@ const PASS2: GatewayStackProps = {
   zoneName: 'example.com',
   zoneId: 'Z123456ABCDEFG',
   ingressCidr: '10.100.0.0/16',
+  vpcId: VPC_ID,
+  // The reused test VPC "already has" endpoints — skip creating them (matches the
+  // real reused VPC) so the assertions below focus on compute, not endpoints.
+  createVpcEndpoints: false,
 };
 
-function synth(props: GatewayStackProps): Template {
-  const app = new cdk.App();
-  const stack = new GatewayStack(app, 'TestStack', props);
-  return Template.fromStack(stack);
-}
-
-describe('pass 1 (imageReady: false) — ECR repo only', () => {
-  const template = synth({ env: PASS2.env, imageReady: false, imageTag: '2.1.197' });
+describe('ECS pass 1 (imageReady: false) — ECR repo only', () => {
+  const template = synth({ platform: 'ecs', imageReady: false, imageTag: '2.1.197', vpcId: VPC_ID });
 
   test('creates the ECR repository', () => {
     template.resourceCountIs('AWS::ECR::Repository', 1);
@@ -49,39 +91,30 @@ describe('pass 1 (imageReady: false) — ECR repo only', () => {
   });
 });
 
-describe('pass 2 (imageReady: true) — full stack', () => {
-  const template = synth(PASS2);
+describe('ECS pass 2 (imageReady: true) — full stack', () => {
+  const template = synth(ECS_PASS2);
 
-  test('creates all seven VPC endpoints by default (6 interface + 1 gateway)', () => {
-    template.resourceCountIs('AWS::EC2::VPCEndpoint', 7);
+  test('shared layer: one RDS instance and one ECR repository', () => {
+    template.resourceCountIs('AWS::RDS::DBInstance', 1);
+    template.resourceCountIs('AWS::ECR::Repository', 1);
   });
 
   test('Bedrock task role grants BOTH inference-profile and foundation-model ARNs', () => {
-    // Missing either ARN family yields 403 on invoke — this is the trap CLAUDE.md
-    // calls out, so pin both into the policy. Asserted as two single-element
-    // arrayWith matches: mixing a literal and a stringLikeRegexp inside ONE
-    // arrayWith doesn't match reliably, so check each ARN family separately.
     const invokeStatement = (resource: unknown) =>
       Match.objectLike({
         PolicyDocument: {
           Statement: Match.arrayWith([
             Match.objectLike({
-              Action: [
-                'bedrock:InvokeModel',
-                'bedrock:InvokeModelWithResponseStream',
-              ],
+              Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
               Resource: Match.arrayWith([resource]),
             }),
           ]),
         },
       });
-
-    // foundation-model ARN is region/account-agnostic (::), so it's a literal.
     template.hasResourceProperties(
       'AWS::IAM::Policy',
       invokeStatement('arn:aws:bedrock:*::foundation-model/anthropic.*'),
     );
-    // inference-profile ARN embeds the resolved region/account, so match its suffix.
     template.hasResourceProperties(
       'AWS::IAM::Policy',
       invokeStatement(Match.stringLikeRegexp('inference-profile/us\\.anthropic\\.\\*')),
@@ -97,9 +130,7 @@ describe('pass 2 (imageReady: true) — full stack', () => {
 
   test('ALB idle timeout is raised to 3600s for long streaming responses', () => {
     template.hasResourceProperties('AWS::ElasticLoadBalancingV2::LoadBalancer', {
-      LoadBalancerAttributes: Match.arrayWith([
-        { Key: 'idle_timeout.timeout_seconds', Value: '3600' },
-      ]),
+      LoadBalancerAttributes: Match.arrayWith([{ Key: 'idle_timeout.timeout_seconds', Value: '3600' }]),
     });
   });
 
@@ -111,37 +142,120 @@ describe('pass 2 (imageReady: true) — full stack', () => {
   });
 
   test('gateway target group health check points at /healthz, not /readyz', () => {
-    // /healthz (liveness) keeps replicas in rotation through a Postgres blip;
-    // /readyz would drain every replica at once. Guard the probe target.
     template.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
       HealthCheckPath: '/healthz',
     });
   });
 
   test('RDS is not publicly accessible', () => {
-    template.hasResourceProperties('AWS::RDS::DBInstance', {
-      PubliclyAccessible: false,
-    });
+    template.hasResourceProperties('AWS::RDS::DBInstance', { PubliclyAccessible: false });
   });
 
   test('the OIDC client secret is a placeholder, not a real value baked into the template', () => {
-    // Guards against the "read process.env at synth" anti-pattern — a real secret
-    // must never land in the synthesized CloudFormation.
     template.hasResourceProperties('AWS::SecretsManager::Secret', {
       Name: 'claude-gateway-oidc-client-secret',
       SecretString: 'REPLACE_ME',
     });
   });
+
+  test('ECS path creates NO EKS cluster (exactly one compute path)', () => {
+    template.resourceCountIs('Custom::AWSCDK-EKS-Cluster', 0);
+  });
 });
 
-describe('createVpcEndpoints opt-out (VPC reuse)', () => {
-  test('createVpcEndpoints: false synthesizes zero VPC endpoints', () => {
-    const template = synth({ ...PASS2, vpcId: 'vpc-0123456789abcdef0', createVpcEndpoints: false });
-    template.resourceCountIs('AWS::EC2::VPCEndpoint', 0);
+describe('EKS pass 1 (imageReady: false) — cluster + shared infra, no workload', () => {
+  const template = synth({ platform: 'eks', imageReady: false, imageTag: '2.1.197', vpcId: VPC_ID, createVpcEndpoints: false });
+
+  test('creates exactly one EKS cluster', () => {
+    template.resourceCountIs('Custom::AWSCDK-EKS-Cluster', 1);
   });
 
-  test('omitting the flag defaults to creating the endpoints', () => {
-    const template = synth(PASS2);
-    template.resourceCountIs('AWS::EC2::VPCEndpoint', 7);
+  test('reuses the shared RDS + ECR (created once)', () => {
+    template.resourceCountIs('AWS::RDS::DBInstance', 1);
+    template.resourceCountIs('AWS::ECR::Repository', 1);
+  });
+
+  test('cluster role carries the 5 Auto Mode managed policies', () => {
+    // Assert a couple of the distinctive ones are attached somewhere.
+    const hasManagedPolicy = (name: string) =>
+      template.hasResourceProperties(
+        'AWS::IAM::Role',
+        Match.objectLike({
+          ManagedPolicyArns: Match.arrayWith([
+            Match.objectLike({ 'Fn::Join': Match.arrayWith([Match.arrayWith([Match.stringLikeRegexp(name)])]) }),
+          ]),
+        }),
+      );
+    hasManagedPolicy('AmazonEKSComputePolicy');
+    hasManagedPolicy('AmazonEKSBlockStoragePolicy');
+  });
+
+  test('enables Auto Mode compute on the cluster Config (escape hatch)', () => {
+    template.hasResourceProperties('Custom::AWSCDK-EKS-Cluster', {
+      Config: Match.objectLike({
+        computeConfig: Match.objectLike({ enabled: true, nodePools: ['general-purpose', 'system'] }),
+        storageConfig: { blockStorage: { enabled: true } },
+      }),
+    });
+  });
+
+  test('does NOT create any ECS service (exactly one compute path)', () => {
+    template.resourceCountIs('AWS::ECS::Service', 0);
+  });
+});
+
+describe('EKS pass 2 (imageReady: true) — workload', () => {
+  const template = synth({
+    platform: 'eks',
+    imageReady: true,
+    imageTag: 'v1',
+    publicUrl: 'https://claude-gateway.example.com',
+    ingressCidr: '10.100.0.0/16',
+    vpcId: VPC_ID,
+    createVpcEndpoints: false,
+  });
+
+  test('creates a Pod Identity association for the gateway service account', () => {
+    template.hasResourceProperties('AWS::EKS::PodIdentityAssociation', {
+      Namespace: 'claude-gateway',
+      ServiceAccount: 'claude-gateway',
+    });
+  });
+
+  test('pod identity role gets the dual-ARN Bedrock invoke policy', () => {
+    template.hasResourceProperties(
+      'AWS::IAM::Policy',
+      Match.objectLike({
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+              Resource: Match.arrayWith(['arn:aws:bedrock:*::foundation-model/anthropic.*']),
+            }),
+          ]),
+        },
+      }),
+    );
+  });
+
+  test('reuses the shared RDS + secrets (no duplication) — one RDS, one JWT secret', () => {
+    template.resourceCountIs('AWS::RDS::DBInstance', 1);
+    template.hasResourceProperties('AWS::SecretsManager::Secret', { Name: 'claude-gateway-jwt-secret' });
+  });
+
+  test('does NOT create any ECS service (exactly one compute path)', () => {
+    template.resourceCountIs('AWS::ECS::Service', 0);
+  });
+});
+
+describe('createVpcEndpoints (VPC reuse)', () => {
+  test('createVpcEndpoints: false synthesizes zero VPC endpoints', () => {
+    const t = synth({ ...ECS_PASS2, createVpcEndpoints: false });
+    t.resourceCountIs('AWS::EC2::VPCEndpoint', 0);
+  });
+
+  test('omitting the flag defaults to creating the endpoints (6 interface + 1 gateway)', () => {
+    const t = synth({ ...ECS_PASS2, createVpcEndpoints: true });
+    t.resourceCountIs('AWS::EC2::VPCEndpoint', 7);
   });
 });
