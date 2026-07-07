@@ -102,23 +102,27 @@ upstreams:
   #   auth: {}
   # (with a matching `models:` block mapping the PT ARN to bedrock-pt)
 
-telemetry:
-  # The ADOT collector is reached over the gateway ALB's HTTPS :4318 listener.
-  # The gateway REQUIRES https:// for any non-loopback forward_to target and
-  # offers no custom-CA/skip-verify option for it, so the collector sits behind
-  # the ALB's publicly-trusted ACM cert (TLS terminates at the ALB; the collector
-  # speaks plain OTLP/HTTP behind it). Telemetry turns on only when forward_to AND
-  # listen.public_url are both set; the gateway then pushes OTEL_* env to clients
-  # (one-time client approval dialog).
-  forward_to:
-    - url: @@PUBLIC_URL@@:4318
-      # Default is metrics-only. Metrics are aggregate counters (tokens, requests,
-      # latency). logs/traces can carry full bash commands, tool inputs, and file
-      # paths — enable them ONLY on a destination with the access controls and
-      # retention that data warrants.
-      metrics: true
-      # logs: false
-      # traces: false
+# Telemetry (ADOT collector) — the whole `telemetry:` key is emitted by
+# stamp-config.sh ONLY when PUBLIC_URL is https://.
+#
+# The ADOT collector is reached over the gateway ALB's HTTPS :4318 listener. The
+# gateway REQUIRES https:// for any non-loopback forward_to target and offers no
+# custom-CA/skip-verify option, so the collector sits behind the ALB's publicly-
+# trusted ACM cert (TLS terminates at the ALB; the collector speaks plain
+# OTLP/HTTP behind it). Telemetry turns on only when forward_to AND
+# listen.public_url are both set; the gateway then pushes OTEL_* env to clients
+# (one-time client approval dialog).
+#
+# Because forward_to rejects http://, the plain-HTTP worked-example path OMITS the
+# telemetry key entirely (a bare `telemetry:` with no forward_to fails validation),
+# so the config still validates and the gateway boots. Supply certArn (an https
+# public_url) to enable it.
+#
+# When enabled the default is metrics-only. Metrics are aggregate counters
+# (tokens, requests, latency). logs/traces can carry full bash commands, tool
+# inputs, and file paths — enable them ONLY on a destination with the access
+# controls and retention that data warrants.
+@@TELEMETRY_BLOCK@@
 
 # Constrain the model picker to a curated allowlist. This turns the silent
 # Bedrock AccessDenied trap into an explicit allowlist: align this with the

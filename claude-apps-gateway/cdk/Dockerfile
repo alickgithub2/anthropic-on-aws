@@ -21,6 +21,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 # GPG-signed manifest.json before this COPY; the Dockerfile trusts what it's given.
 COPY --chmod=0755 claude /usr/local/bin/claude
 
+# Pre-create /etc/claude with a normal traversable (0755) directory mode. Without
+# this, COPY auto-creates the parent dir using the file's --chmod (0644) — which
+# drops the directory execute/traverse bit, so the nonroot uid can't open files
+# inside it and the gateway fails to boot with EACCES on /etc/claude/gateway.yaml.
+WORKDIR /etc/claude
+
 # The stamped config (real literal values; only secrets + DB facts remain as
 # ${VAR} for boot-time env expansion). Read once at boot, never written.
 # --chmod=0644 so the nonroot uid can read it regardless of the host file's mode

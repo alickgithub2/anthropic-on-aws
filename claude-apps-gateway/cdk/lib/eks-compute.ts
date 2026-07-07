@@ -115,6 +115,29 @@ export class EksCompute extends Construct {
     creationRole.addToPolicy(
       new iam.PolicyStatement({ actions: ['iam:PassRole'], resources: [nodeRole.roleArn] }),
     );
+    // With authenticationMode=API(_AND_CONFIG_MAP), CDK's cluster handler creates
+    // an EKS access entry so the creation role keeps kubectl/admin access — but
+    // the auto-generated CreationRole isn't granted the access-entry actions, so
+    // CreateCluster's follow-up CreateAccessEntry is denied and the stack rolls
+    // back. Grant the access-entry management actions on this cluster (the ARN is
+    // deterministic: the clusterName is fixed above).
+    creationRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'eks:CreateAccessEntry',
+          'eks:DeleteAccessEntry',
+          'eks:DescribeAccessEntry',
+          'eks:ListAccessEntries',
+          'eks:AssociateAccessPolicy',
+          'eks:DisassociateAccessPolicy',
+          'eks:ListAssociatedAccessPolicies',
+        ],
+        resources: [
+          `arn:aws:eks:${stack.region}:${stack.account}:cluster/${clusterName}`,
+          `arn:aws:eks:${stack.region}:${stack.account}:access-entry/${clusterName}/*`,
+        ],
+      }),
+    );
 
     // ── Shared-layer connectivity for pods ────────────────────────────────────
     // Pods run on Auto Mode nodes that use the cluster security group for their

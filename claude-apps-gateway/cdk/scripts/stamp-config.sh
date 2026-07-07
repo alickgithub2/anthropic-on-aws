@@ -59,6 +59,21 @@ else
   google_block=''
 fi
 
+# telemetry.forward_to requires an https:// target — the gateway rejects http://
+# for any non-loopback URL, AND a bare `telemetry:` key with no forward_to fails
+# validation. So emit the WHOLE telemetry block only when PUBLIC_URL is https://
+# (a cert is in play); on the plain-HTTP worked-example path omit the key entirely
+# (a one-line comment) so the config still validates and the gateway boots.
+# (Literal backslash-n; awk `subst` expands them into real newlines — see
+# google_block.)
+if printf '%s' "${PUBLIC_URL}" | grep -qiE '^https://'; then
+  telemetry_block='telemetry:\n  forward_to:\n    - url: '"${PUBLIC_URL}"':4318\n      metrics: true\n      # logs: false\n      # traces: false'
+  echo "stamp-config: https public_url — stamping telemetry block (ADOT :4318)" >&2
+else
+  telemetry_block='# telemetry: omitted — public_url is http:// (no ACM cert); forward_to needs https.'
+  echo "stamp-config: http public_url — telemetry omitted (needs https)" >&2
+fi
+
 # Substitute with awk using literal string replacement (no regex interpretation of
 # the values — URLs/issuers contain '/', '.', etc. that would break sed s///).
 subst() {
@@ -80,6 +95,7 @@ subst '@@PUBLIC_URL@@'            "${PUBLIC_URL}"            < "${TEMPLATE}" \
   | subst '@@OIDC_CLIENT_ID@@'        "${OIDC_CLIENT_ID}" \
   | subst '@@ALLOWED_EMAIL_DOMAINS@@' "${domains_yaml}" \
   | subst '@@OIDC_GOOGLE_BLOCK@@'     "${google_block}" \
+  | subst '@@TELEMETRY_BLOCK@@'       "${telemetry_block}" \
   | subst '@@DB_NAME@@'               "${DB_NAME}" \
   > "${tmp}"
 
