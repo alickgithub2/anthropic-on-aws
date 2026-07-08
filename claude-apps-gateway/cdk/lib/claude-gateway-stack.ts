@@ -104,7 +104,7 @@ export class GatewayStack extends cdk.Stack {
         imageTag: props.imageTag,
         publicUrl: props.publicUrl,
         ingressCidr: props.ingressCidr,
-        certArn: props.certArn,
+        certArn: props.certArn,>>>>>>> e24e3b3 (docs: keep ADRs local — remove docs/adr, inline the rationale)
       });
     }
   }
