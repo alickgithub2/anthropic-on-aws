@@ -10,3 +10,5 @@ linux-x64/
 # …and the STAMPED config (the committed source is gateway.yaml.template;
 # stamp-config.sh renders gateway.yaml from it, with real per-deploy values).
 gateway.yaml
+manifest.json
+manifest.json.sig
