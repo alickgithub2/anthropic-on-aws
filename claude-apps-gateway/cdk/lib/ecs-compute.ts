@@ -7,6 +7,10 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import { SharedResources } from './shared-resources';
 
 export interface EcsComputeProps {
@@ -15,25 +19,36 @@ export interface EcsComputeProps {
   readonly publicUrl: string;
   readonly ingressCidr: string;
   /**
-   * ACM cert ARN for publicUrl's hostname. When provided the ALB serves HTTPS on
-   * 443 (+ the HTTPS :4318 telemetry listener); when omitted it serves plain HTTP
-   * on 80 (a worked-example / test convenience — production must supply a cert).
+   * ACM cert ARN for publicUrl's hostname — IMPORTED mode.
+   * Omit to use MANAGED-PUBLIC mode (requires publicZoneId + publicZoneName).
+   * Without either the ALB serves plain HTTP on 80 (test convenience only).
    */
   readonly certArn?: string;
-  /** Route 53 hosted-zone name; when set an alias record is created for publicUrl. */
+  /** Route 53 PRIVATE hosted-zone name; when set an alias A-record is created. */
   readonly zoneName?: string;
-  /** Route 53 hosted-zone id (optional; looked up from zoneName if omitted). */
+  /** Route 53 private hosted-zone id (optional; looked up from zoneName if omitted). */
   readonly zoneId?: string;
+  /** PUBLIC hosted-zone id — managed mode only; used solely for ACM DNS validation. */
+  readonly publicZoneId?: string;
+  /** PUBLIC hosted-zone name — managed mode only; explicit, not derived from zoneName. */
+  readonly publicZoneName?: string;
+  /** Deploy the CloudWatch dashboard + alarms (default false). */
+  readonly enableDashboard?: boolean;
+  /** Daily cost-alarm threshold in USD (dashboard mode; enables the cost alarm when > 0). */
+  readonly dailyCostThresholdUsd?: number;
+  /** Optional email for an SNS alarm subscription (dashboard mode). */
+  readonly alarmEmail?: string;
 }
 
 /**
  * The ECS Fargate compute path: a gateway service behind an internal IPv4 ALB,
  * reusing the shared RDS, ECR, and secrets. Mirrors what setup.sh provisions.
  *
- * When a cert is supplied the full HTTPS posture (443 + the HTTPS :4318 ADOT
- * telemetry listener + optional Route 53 record) is created, exactly as before;
- * without one the ALB serves plain HTTP on 80 so the worked example still
- * deploys end-to-end for testing.
+ * TLS mode is selected by cert presence:
+ *   - certArn set → IMPORTED: ALB uses your cert; CLI shows a fingerprint prompt.
+ *   - certArn absent + publicZoneId/publicZoneName set → MANAGED-PUBLIC: stack
+ *     requests a DNS-validated public ACM cert; no fingerprint prompt.
+ *   - neither set → HTTP on 80 (worked-example / test convenience only).
  */
 export class EcsCompute extends Construct {
   public readonly albDnsName: string;
@@ -45,9 +60,31 @@ export class EcsCompute extends Construct {
     const stack = cdk.Stack.of(this);
     const vpc = shared.vpc;
     const taskSg = shared.workloadSg;
-    const hasCert = !!props.certArn;
-    // publicUrl is https://<host>; the record name is the host part.
     const recordHost = props.publicUrl.replace(/^https?:\/\//, '');
+
+    // TLS mode: imported cert → use as-is; no cert + public zone → managed cert;
+    // neither → HTTP only (test path).
+    // Fail fast if the user provides a partial managed-cert config.
+    const hasManagedZoneConfig = !!props.publicZoneId || !!props.publicZoneName;
+    if (hasManagedZoneConfig && (!props.publicZoneId || !props.publicZoneName)) {
+      throw new Error('Managed-cert mode requires both publicZoneId and publicZoneName.');
+    }
+    const managedCert = !props.certArn && hasManagedZoneConfig;
+    const hasCert = !!props.certArn || managedCert;
+
+    let certificate: acm.ICertificate | undefined;
+    if (props.certArn) {
+      certificate = acm.Certificate.fromCertificateArn(this, 'Cert', props.certArn);
+    } else if (managedCert) {
+      const publicZone = route53.HostedZone.fromHostedZoneAttributes(this, 'PublicZone', {
+        hostedZoneId: props.publicZoneId!,
+        zoneName: props.publicZoneName!,
+      });
+      certificate = new acm.Certificate(this, 'Cert', {
+        domainName: recordHost,
+        validation: acm.CertificateValidation.fromDns(publicZone),
+      });
+    }
 
     // ── ECS cluster ───────────────────────────────────────────────────────────
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc, clusterName: 'claude-gateway' });
@@ -65,7 +102,6 @@ export class EcsCompute extends Construct {
     // IPv4-only on purpose: internal dual-stack ALBs return public-range AAAA
     // records that /login rejects.
     const image = ecs.ContainerImage.fromEcrRepository(shared.repo, props.imageTag);
-    const listenerProtocol = hasCert ? elbv2.ApplicationProtocol.HTTPS : elbv2.ApplicationProtocol.HTTP;
 
     // A Route 53 record is created only when a zone AND a cert are supplied —
     // aliasing an HTTP-only ALB under an https:// public_url would mislead.
@@ -92,10 +128,10 @@ export class EcsCompute extends Construct {
       openListener: false, // don't open to 0.0.0.0/0; restrict to ingressCidr below
       taskSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [taskSg],
-      protocol: listenerProtocol,
-      ...(hasCert
+      protocol: hasCert ? elbv2.ApplicationProtocol.HTTPS : elbv2.ApplicationProtocol.HTTP,
+      ...(certificate
         ? {
-            certificate: acm.Certificate.fromCertificateArn(this, 'Cert', props.certArn!),
+            certificate,
             sslPolicy: elbv2.SslPolicy.TLS13_RES,
           }
         : {}),
@@ -134,11 +170,8 @@ export class EcsCompute extends Construct {
     fargate.targetGroup.configureHealthCheck({ path: '/healthz', healthyHttpCodes: '200' });
 
     // ── Telemetry: HTTPS :4318 listener + ADOT collector (cert path only) ─────
-    // The gateway requires https:// for a non-loopback forward_to and offers no
-    // custom-CA/skip-verify, so the collector must sit behind the ALB's
-    // publicly-trusted cert. Skipped entirely on the HTTP (no-cert) path.
-    if (hasCert) {
-      this.addTelemetry(fargate, taskSg, props.certArn!, recordHost, shared);
+    if (hasCert && certificate) {
+      this.addTelemetry(fargate, taskSg, certificate, recordHost, shared);
     }
 
     this.albDnsName = fargate.loadBalancer.loadBalancerDnsName;
@@ -151,6 +184,72 @@ export class EcsCompute extends Construct {
       description: 'Register this redirect URI on your OIDC client',
     });
     new cdk.CfnOutput(stack, 'TaskRoleArn', { value: taskRole.roleArn });
+    if (managedCert) {
+      new cdk.CfnOutput(stack, 'CertMode', {
+        value: 'managed-public (browser-trusted ACM cert; no fingerprint comparison needed)',
+      });
+    } else if (hasCert) {
+      new cdk.CfnOutput(stack, 'CertFingerprintHint', {
+        value: `openssl s_client -connect ${recordHost}:443 -servername ${recordHost} | openssl x509 -noout -fingerprint -sha256`,
+        description: 'Run this to get the cert SHA-256 to publish to developers (the CLI pins it)',
+      });
+    }
+
+    // ── CloudWatch dashboard + alarms (opt-in; default off) ───────────────────
+    if (props.enableDashboard) {
+      const alb = fargate.loadBalancer;
+      const alb5xx = alb.metrics.httpCodeElb(elbv2.HttpCodeElb.ELB_5XX_COUNT, {
+        statistic: 'Sum',
+        period: cdk.Duration.minutes(5),
+      });
+      const targetResp = alb.metrics.targetResponseTime({ period: cdk.Duration.minutes(5) });
+      const reqCount = alb.metrics.requestCount({ period: cdk.Duration.minutes(5) });
+      const cpu = fargate.service.metricCpuUtilization({ period: cdk.Duration.minutes(5) });
+
+      let alarmAction: cloudwatchActions.SnsAction | undefined;
+      if (props.alarmEmail) {
+        const topic = new sns.Topic(this, 'AlarmTopic', { displayName: 'claude-gateway-alarms' });
+        topic.addSubscription(new snsSubscriptions.EmailSubscription(props.alarmEmail));
+        alarmAction = new cloudwatchActions.SnsAction(topic);
+      }
+
+      const errorAlarm = new cloudwatch.Alarm(this, 'Alb5xxAlarm', {
+        alarmName: 'claude-gateway-alb-5xx',
+        metric: alb5xx,
+        threshold: 5,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      if (alarmAction) errorAlarm.addAlarmAction(alarmAction);
+
+      const costMetric = new cloudwatch.Metric({
+        namespace: 'ClaudeGateway',
+        metricName: 'cost.usage',
+        statistic: 'Sum',
+        period: cdk.Duration.hours(24),
+      });
+      if (props.dailyCostThresholdUsd && props.dailyCostThresholdUsd > 0) {
+        const costAlarm = new cloudwatch.Alarm(this, 'DailyCostAlarm', {
+          alarmName: 'claude-gateway-daily-cost',
+          metric: costMetric,
+          threshold: props.dailyCostThresholdUsd,
+          evaluationPeriods: 1,
+          comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        });
+        if (alarmAction) costAlarm.addAlarmAction(alarmAction);
+      }
+
+      const dashboard = new cloudwatch.Dashboard(this, 'Dashboard', { dashboardName: 'claude-gateway' });
+      dashboard.addWidgets(
+        new cloudwatch.GraphWidget({ title: 'ALB requests', left: [reqCount], width: 12 }),
+        new cloudwatch.GraphWidget({ title: 'ALB 5xx', left: [alb5xx], width: 12 }),
+        new cloudwatch.GraphWidget({ title: 'Target response time', left: [targetResp], width: 12 }),
+        new cloudwatch.GraphWidget({ title: 'Gateway CPU', left: [cpu], width: 12 }),
+        new cloudwatch.GraphWidget({ title: 'Daily cost (ClaudeGateway)', left: [costMetric], width: 12 }),
+      );
+    }
   }
 
   /**
@@ -161,7 +260,7 @@ export class EcsCompute extends Construct {
   private addTelemetry(
     fargate: ecsPatterns.ApplicationLoadBalancedFargateService,
     taskSg: ec2.ISecurityGroup,
-    certArn: string,
+    certificate: acm.ICertificate,
     recordHost: string,
     shared: SharedResources,
   ): void {
@@ -231,7 +330,7 @@ export class EcsCompute extends Construct {
     const otelListener = fargate.loadBalancer.addListener('OtelListener', {
       port: 4318,
       protocol: elbv2.ApplicationProtocol.HTTPS,
-      certificates: [acm.Certificate.fromCertificateArn(this, 'OtelCert', certArn)],
+      certificates: [certificate],
       sslPolicy: elbv2.SslPolicy.TLS13_RES,
     });
     otelListener.addTargets('OtelTargets', {
