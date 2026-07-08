@@ -122,7 +122,7 @@ npx cdk deploy -c platform=eks -c imageReady=true \
 | `ingressCidr` | The VPN/corp **client** CIDR developers connect from — *not* the VPC CIDR (pass 2). |
 | `certArn` | ACM cert ARN for `publicUrl`'s hostname (optional; the ALB/Ingress falls back to HTTP:80 if omitted). |
 | `zoneName` / `zoneId` | Route 53 hosted-zone name/id for the DNS record (optional; ECS). |
-| `vpcId` | Import an existing VPC instead of creating one (optional). |
+| `vpcId` | Import an existing VPC instead of creating one (optional). Pass on the CLI (`-c vpcId=vpc-…`) — do not hardcode an account-specific VPC id in `cdk.json`. |
 | `createVpcEndpoints` | `false` to skip VPC endpoint creation when re-using a VPC that already has them (default `true`). |
 
 > **Switching platforms.** Because both platforms are the same stack (`ClaudeGatewayStack`) with a different compute layer, moving from one to the other means `cdk destroy` the current platform, then `cdk deploy` the other. CloudFormation will not run ECS and EKS side by side.
