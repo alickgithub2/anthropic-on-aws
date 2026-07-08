@@ -223,7 +223,17 @@ export class EksCompute extends Construct {
       repository: 'https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts',
       namespace: 'kube-system',
       release: 'csi-secrets-store',
-      values: { syncSecret: { enabled: true }, enableSecretRotation: true },
+      values: {
+        syncSecret: { enabled: true },
+        enableSecretRotation: true,
+        // tokenRequests puts these audiences on the CSIDriver object so the driver
+        // requests a bound ServiceAccount token and passes it to the AWS provider,
+        // which exchanges it (via EKS Pod Identity) for the pod role's credentials.
+        // The standalone chart defaults this to [] — without it the mount fails with
+        // "serviceAccount.tokens not provided". (The AWS provider's OWN bundled CSI
+        // subchart sets these; we disable that subchart below, so we set them here.)
+        tokenRequests: [{ audience: 'sts.amazonaws.com' }, { audience: 'pods.eks.amazonaws.com' }],
+      },
     });
     // The AWS provider chart bundles the Secrets Store CSI driver as a subchart
     // that installs BY DEFAULT (secrets-store-csi-driver.install=true). We install
@@ -281,6 +291,12 @@ export class EksCompute extends Construct {
       spec: {
         provider: 'aws',
         parameters: {
+          // Authenticate via EKS Pod Identity (the PodIdentity association above),
+          // NOT IRSA. Without this the AWS provider defaults to IRSA and fails the
+          // mount with "An IAM role must be associated with service account" because
+          // we intentionally don't annotate the SA with eks.amazonaws.com/role-arn.
+          // Value is a string ("true"); the provider parses it case-insensitively.
+          usePodIdentity: 'true',
           region: stack.region,
           objects: yamlList([
             { objectName: shared.jwtSecret.secretArn, objectType: 'secretsmanager', objectAlias: 'jwt-secret' },

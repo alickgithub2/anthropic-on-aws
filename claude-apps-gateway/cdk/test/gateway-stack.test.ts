@@ -247,6 +247,38 @@ describe('EKS pass 2 (imageReady: true) — workload', () => {
     template.resourceCountIs('AWS::ECS::Service', 0);
   });
 
+  test('SecretProviderClass authenticates via Pod Identity, not IRSA', () => {
+    // usePodIdentity: "true" tells the AWS provider to use the EKS Pod Identity
+    // association (not IRSA). Without it the mount fails: "An IAM role must be
+    // associated with service account" since we don't annotate the SA for IRSA.
+    // The SPC manifest interpolates secret ARNs, so its Manifest is a Fn::Join
+    // array; usePodIdentity sits in the first literal chunk. Assert that chunk
+    // exists anywhere in the joined pieces.
+    template.hasResourceProperties(
+      'Custom::AWSCDK-EKS-KubernetesResource',
+      Match.objectLike({
+        Manifest: {
+          'Fn::Join': Match.arrayWith([
+            Match.arrayWith([Match.stringLikeRegexp('"usePodIdentity":"true"')]),
+          ]),
+        },
+      }),
+    );
+  });
+
+  test('CSI driver chart sets tokenRequests audiences (needed for Pod Identity mount)', () => {
+    // Without tokenRequests on the CSIDriver object the driver can't obtain a bound
+    // SA token for the AWS provider and the mount fails: "serviceAccount.tokens not
+    // provided". The standalone chart defaults this to [], so we set it explicitly.
+    template.hasResourceProperties(
+      'Custom::AWSCDK-EKS-HelmChart',
+      Match.objectLike({
+        Chart: 'secrets-store-csi-driver',
+        Values: Match.stringLikeRegexp('"audience":"sts\\.amazonaws\\.com".*"audience":"pods\\.eks\\.amazonaws\\.com"'),
+      }),
+    );
+  });
+
   test('AWS provider Helm chart disables its bundled CSI driver subchart', () => {
     // The secrets-store-csi-driver-provider-aws chart ships the CSI driver as a
     // subchart that installs by default. We install the driver as its own release,
