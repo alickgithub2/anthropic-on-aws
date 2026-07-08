@@ -71,3 +71,4 @@ mkdocs-env/*
 docs/**/images/
 !docs/images/
 !/.projenrc.js
+/progress/

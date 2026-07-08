@@ -20,6 +20,7 @@ const REGION = 'us-east-1';
 // instead of fromLookup, which would otherwise require live account credentials.
 const PASS2: GatewayStackProps = {
   env: { account: ACCOUNT, region: REGION },
+  platform: 'ecs',
   imageReady: true,
   imageTag: '2.1.197',
   publicUrl: 'https://claude-gateway.example.com',
@@ -36,7 +37,7 @@ function synth(props: GatewayStackProps): Template {
 }
 
 describe('pass 1 (imageReady: false) — ECR repo only', () => {
-  const template = synth({ env: PASS2.env, imageReady: false, imageTag: '2.1.197' });
+  const template = synth({ env: PASS2.env, platform: 'ecs', imageReady: false, imageTag: '2.1.197' });
 
   test('creates the ECR repository', () => {
     template.resourceCountIs('AWS::ECR::Repository', 1);
@@ -162,8 +163,16 @@ describe('TLS mode selection (imported vs managed public cert)', () => {
     expect(() => template.hasOutput('CertFingerprintHint', {})).toThrow();
   });
 
-  test('managed mode fails fast without an explicit public zone', () => {
-    expect(() => synth({ ...MANAGED, publicZoneId: undefined })).toThrow(/publicZoneId/);
+  test('neither cert nor public zone → HTTP mode: no in-stack cert, plain HTTP ALB (worked-example fallback)', () => {
+    // The merged three-mode selector (imported / managed / HTTP) lets the worked
+    // example deploy end-to-end without any TLS inputs: absent certArn AND absent
+    // public zone falls back to a plain-HTTP internal ALB on :80 instead of failing.
+    const template = synth({ ...MANAGED, publicZoneId: undefined, publicZoneName: undefined });
+    template.resourceCountIs('AWS::CertificateManager::Certificate', 0);
+    template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 80,
+      Protocol: 'HTTP',
+    });
   });
 });
 
