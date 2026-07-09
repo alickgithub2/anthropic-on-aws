@@ -52,16 +52,38 @@ target. A natural AWS design points it at a collector over a private Cloud Map n
 claude gateway: EACCES: permission denied, open '/etc/claude/gateway.yaml'
 ```
 
-**Why:** the distroless image runs as the `nonroot` uid (65532). If your build
-stamps `gateway.yaml` via `mktemp` (which creates files at mode `0600`, owner-only)
-and then `COPY`s it, the file lands root-owned and unreadable by `nonroot`.
+**Why:** the distroless image runs as the `nonroot` uid (65532). Two ways to
+land here: the file itself isn't readable, *or* its parent dir isn't traversable.
 
-**Fix:** `COPY --chmod=0644 gateway.yaml /etc/claude/gateway.yaml` in the Dockerfile.
-Don't rely on the host file's mode.
+- If your build stamps `gateway.yaml` via `mktemp` (mode `0600`, owner-only) and
+  then `COPY`s it, the file lands root-owned and unreadable by `nonroot`.
+- The obvious one-liner fix — `COPY --chmod=0644 gateway.yaml /etc/claude/gateway.yaml`
+  — is **not enough on Docker/BuildKit**: the `--chmod` also stamps the
+  *auto-created* `/etc/claude` parent at `0644`, dropping its traverse (execute)
+  bit, so `nonroot` can't enter the directory → same `EACCES`. (podman's builder
+  doesn't propagate the mode to the parent, so the one-liner *appears* to work
+  there — an easy way to ship this bug if you only test on podman.)
+
+**Fix:** assemble `/etc/claude` in a small builder stage with explicit modes
+(dir `0755`, file `0644`), then copy the finished tree into the shell-less
+distroless image — `COPY --from` preserves the modes verbatim on every builder:
+
+```dockerfile
+FROM debian:12-slim AS config
+COPY gateway.yaml /tmp/gateway.yaml
+RUN mkdir -p /out/etc/claude \
+ && cp /tmp/gateway.yaml /out/etc/claude/gateway.yaml \
+ && chmod 0755 /out/etc/claude \
+ && chmod 0644 /out/etc/claude/gateway.yaml
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=config /out/etc/claude /etc/claude
+```
 
 > Customer takeaway: any file you bake into a non-root distroless image needs an
-> explicit readable mode. This bites silently — the build succeeds, the container
-> only fails at runtime.
+> explicit readable mode **and** a traversable parent dir. This bites silently —
+> the build succeeds, the container only fails at runtime — and it's
+> builder-dependent, so a green build on one engine doesn't clear the other.
 
 ---
 
@@ -248,12 +270,15 @@ cert, developers need the CA in their OS trust store or `NODE_EXTRA_CA_CERTS` se
 - **EC2 security-group rule *descriptions* reject `>`.** Allowed charset is
   `a-zA-Z0-9. _-:/()#,@[]+=&;{}!$*`. Using `->` arrows in a rule description fails
   with `Invalid rule description`. Use `to`.
-- **`docker` isn't required — `podman` works, but drop `--provenance=false`.** On an
-  arm64 Mac, podman built the `linux/amd64` image via its VM's emulation and pushed
-  to ECR fine. But `--provenance=false` is a **buildx-only** flag — `podman build`
-  rejects it with `unknown flag: --provenance`. Podman emits a plain (non-OCI-index)
-  image by default, so just omit the flag when building with podman. (The flag
-  exists to stop buildx emitting an OCI image index that some runtimes reject.)
+- **`docker` isn't required — `podman`/`finch` work, and `setup.sh` handles the
+  flag difference.** On an arm64 Mac, podman built the `linux/amd64` image via its
+  VM's emulation and pushed to ECR fine. The trap: `--provenance=false` is a
+  **buildx-only** flag — `podman build` rejects it with `unknown flag: --provenance`.
+  (The flag exists to stop buildx emitting an OCI image index that some runtimes
+  reject; podman emits a plain image by default, so it simply doesn't need it.)
+  `setup.sh` auto-detects `docker`/`podman`/`finch` (override with
+  `CONTAINER_TOOL=…`) and only passes `--provenance=false` to docker — if you
+  build by hand with podman, omit the flag yourself.
 - **`setup.sh` needs bash 4+, but macOS ships bash 3.2.** The script uses no
   bash-4-isms now (an earlier `mapfile` was replaced with a `while read` loop), but
   if you extend it, avoid `mapfile`/`readarray`, `declare -A`, and `${var,,}`/`${var^^}`
@@ -347,3 +372,44 @@ interactive picker doesn't special-case an existing gateway session.
 just use the session (`claude -p "…"`). Confirm the session works end-to-end with a
 real prompt; an `inference` event in the gateway audit log is the proof that
 CLI → gateway → Bedrock → back all work.
+
+---
+
+## 17. Managed cert mode: ACM validation stalls ~30–90 min (wrong public zone)
+
+**Symptom:** with no `CERT_ARN` supplied (managed public-cert mode), the deploy
+blocks for 30–90 minutes and eventually times out. The ACM cert stays in
+`PENDING_VALIDATION`; CloudFormation never sees the cert flip to `ISSUED`.
+
+**Why:** in managed cert mode the stack requests a DNS-validated public ACM cert
+and writes the validation CNAME record into the Route 53 zone identified by
+`PUBLIC_ZONE_ID`. If that zone is **not the publicly authoritative, delegated zone**
+for the gateway hostname's parent domain — e.g. it's a private hosted zone, or the
+domain isn't delegated to it via its NS records — ACM's validators cannot read the
+challenge from the public DNS tree, so the cert never validates. The failure is
+**silent**: ACM simply waits, and the deploy blocks until CloudFormation's cert
+creation times out.
+
+**Why the split-horizon design exists:** the gateway's **A-record** lives only in
+the **private** hosted zone (`ZONE_ID`), so the hostname is never publicly
+resolvable — developers must be on the private network path to reach it. The public
+zone (`PUBLIC_ZONE_ID` / `PUBLIC_ZONE_NAME`) exists *only* for this transient
+validation CNAME; once the cert is issued the record can be left in place (harmless)
+or cleaned up.
+
+**Fix:** point `PUBLIC_ZONE_ID` / `PUBLIC_ZONE_NAME` at the **real, publicly
+delegated** hosted zone for the domain. Verify by checking that the zone's NS
+records are live in the public DNS tree:
+```
+# <parent-domain> = PUBLIC_ZONE_NAME (the hostname's parent, e.g. example.com for
+# claude-gateway.example.com) — NOT the full gateway hostname.
+dig NS <parent-domain> +short        # should return Route 53 nameservers
+aws route53 get-hosted-zone --id <PUBLIC_ZONE_ID>   # confirm PublicZone: true
+```
+`setup.sh` emits a preflight warning if the zone's `PrivateZone` flag is `true`; CDK
+relies on the ACM/CloudFormation timeout to surface the problem.
+
+> Customer takeaway: the public zone is not for routing — it's solely for the
+> validation CNAME. But it must be the **real** delegated public zone or ACM can't
+> see the challenge. A private zone or an undelegated domain silently stalls the
+> entire deploy.

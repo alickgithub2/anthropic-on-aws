@@ -1,0 +1,3 @@
+# Ignore all progress tracking files — these are local agent workspace files only
+*
+!.gitignore

@@ -1,6 +1,15 @@
 # Claude Apps Gateway: Deploy on AWS with CDK
 
-This CDK stack deploys the Claude apps gateway on Amazon ECS Fargate with everything it needs to run: load balancer, database, DNS, TLS, and IAM roles. After deployment, you push a config file to developer machines and they can sign in with corporate SSO.
+This CDK stack deploys the Claude apps gateway on AWS with everything it needs to run: load balancer, database, DNS, TLS, and IAM roles. After deployment, you push a config file to developer machines and they can sign in with corporate SSO.
+
+**One stack, two compute platforms.** A single `-c platform=` flag chooses where the gateway runs:
+
+| `-c platform=` | Compute | Credentials | Secrets delivery |
+|----------------|---------|-------------|------------------|
+| `ecs` (or unset default is `eks`) | ECS Fargate behind an internal IPv4 ALB | ECS task role | env vars from Secrets Manager |
+| `eks` | EKS Auto Mode with an internal IPv4 ALB Ingress | EKS Pod Identity | files mounted by the Secrets Store CSI driver |
+
+The app **only ever synthesizes one platform** — it never deploys both at once, and any value other than `ecs`/`eks` fails synth. Both platforms share the same data + networking layer (RDS, ECR, Secrets Manager, VPC endpoints, log group), so switching platforms re-uses the same resource wiring. See [Selecting a platform](#selecting-a-platform) below.
 
 ![Claude Apps Gateway Architecture](../images/architecture.png)
 
@@ -79,7 +88,87 @@ tar -xzf claude-gateway-*-all.tar.gz linux-x64/claude
 
 Or download it via the standard installer on a Linux machine.
 
+## Selecting a platform
+
+Deploy is a **two-pass** operation on either platform (the gateway's `public_url` drives its OIDC discovery doc, so pass 1 provisions the load balancer and prints its hostname; you set that as `publicUrl` in pass 2). The only forced ordering is *image-before-workload* — pass 1 creates the ECR repo, you push the image, pass 2 starts the workload.
+
+```bash
+# ── Pass 1: shared infra + ECR repo (and, on EKS, the cluster) ──────────────
+npx cdk deploy -c platform=ecs -c imageReady=false      # ECS
+npx cdk deploy -c platform=eks -c imageReady=false      # EKS
+
+# build + push the gateway image to the ECR URI printed by pass 1, tagged e.g. v1
+
+# ── Pass 2: the gateway workload on the chosen platform ─────────────────────
+npx cdk deploy -c platform=ecs -c imageReady=true \
+  -c imageTag=v1 \
+  -c publicUrl=https://claude-gateway.internal.company.com \
+  -c ingressCidr=10.0.0.0/8            # your VPN/corp client CIDR
+
+npx cdk deploy -c platform=eks -c imageReady=true \
+  -c imageTag=v1 \
+  -c publicUrl=https://claude-gateway.internal.company.com \
+  -c ingressCidr=10.0.0.0/8
+```
+
+**Context flags** (`-c key=value`, or set in `cdk.json` / `cdk.context.json`):
+
+| Flag | Meaning |
+|------|---------|
+| `platform` | `ecs` or `eks` (default `eks`). Exactly one compute path per synth — never both. |
+| `imageReady` | `false` for pass 1 (infra + ECR only); `true`/unset for pass 2 (workload). |
+| `imageTag` | ECR image tag to run (default: the pinned Claude version). |
+| `publicUrl` | Internal ALB origin developers connect to, e.g. `https://claude-gateway.internal.company.com` (pass 2). |
+| `ingressCidr` | The VPN/corp **client** CIDR developers connect from — *not* the VPC CIDR (pass 2). |
+| `certArn` | ACM cert ARN for `publicUrl`'s hostname (optional; the ALB/Ingress falls back to HTTP:80 if omitted). |
+| `zoneName` / `zoneId` | Route 53 hosted-zone name/id for the DNS record (optional; ECS). |
+| `vpcId` | Import an existing VPC instead of creating one (optional). Pass on the CLI (`-c vpcId=vpc-…`) — do not hardcode an account-specific VPC id in `cdk.json`. |
+| `createVpcEndpoints` | `false` to skip VPC endpoint creation when re-using a VPC that already has them (default `true`). |
+
+> **Switching platforms.** Because both platforms are the same stack (`ClaudeGatewayStack`) with a different compute layer, moving from one to the other means `cdk destroy` the current platform, then `cdk deploy` the other. CloudFormation will not run ECS and EKS side by side.
+
+### Shared resources layer
+
+The stack is split so the data + networking plane is defined **once** and each platform layers its compute on top:
+
+- `lib/shared-resources.ts` — VPC (or imported), VPC endpoints, RDS PostgreSQL, ECR repo, Secrets Manager secrets (JWT / OIDC client / DB), and the CloudWatch log group.
+- `lib/ecs-compute.ts` — ECS Fargate service, task/execution roles, internal ALB. Reads secrets as env vars.
+- `lib/eks-compute.ts` — EKS Auto Mode cluster, Pod Identity role + association, Kubernetes manifests (namespace, SA, `SecretProviderClass`, Deployment, Service, Ingress), and the Secrets Store CSI driver + AWS provider Helm charts. Reads secrets as mounted files.
+- `lib/claude-gateway-stack.ts` — instantiates `SharedResources` once, then exactly one of `EcsCompute` / `EksCompute` based on `platform`.
+
+## TLS: managed public cert vs. imported cert
+
+The gateway needs a TLS cert on the internal ALB. The mode is chosen by **whether
+you supply a cert** — there is no separate mode flag:
+
+| You set | Mode | What happens | First `/login` |
+|---|---|---|---|
+| `certArn` | **imported** | The ALB uses your cert as-is. | CLI shows a SHA-256 **fingerprint prompt** (the example prints the fingerprint to publish). |
+| *nothing* | **managed public** (recommended) | The stack **requests a DNS-validated public ACM cert** for the gateway host. | **No prompt** — the cert is browser-trusted. No `NODE_EXTRA_CA_CERTS`, no keychain import. |
+
+**Managed mode uses split-horizon DNS:**
+
+- The **private** zone (`zoneId`/`zoneName`) holds the gateway's **A-record →
+  internal ALB** — the only record `/login` resolves, and it answers a private IP.
+- The **public** zone (`publicZoneId` + `publicZoneName`, both explicit) is used
+  **only** for the ACM validation CNAME. No gateway A-record is written there, so the
+  hostname is **never publicly resolvable** — no topology leak.
+
+The public zone must be the **publicly authoritative, delegated** zone for the
+hostname's parent domain. Pointing it at a private or non-delegated zone leaves ACM in
+`PENDING_VALIDATION` and stalls the deploy ~30–90 min — see [`../docs/gotchas.md`](../docs/gotchas.md).
+
 ## How to deploy
+
+> [!IMPORTANT]
+> The canonical, verified walkthrough (for both this CDK track and `setup.sh`) is
+> [`../docs/deployment.md`](../docs/deployment.md) — a two-pass `cdk deploy` driven
+> by the [context variables below](#cdk-context-variables), with the image built
+> from the tracked distroless `Dockerfile` and SHA-verified binary. The
+> `.env` + `deploy.sh` flow in the steps below is a convenience path: `deploy.sh`
+> builds the image via CodeBuild using its own inline Dockerfile and config, and
+> `npx cdk deploy` still needs the required context values supplied (e.g. in
+> `cdk.context.json`).
 
 ### Step 1: Configure
 
@@ -186,6 +275,34 @@ All values come from `.env`. The CDK code reads them at deploy time.
 | `OIDC_CLIENT_SECRET` | OAuth client secret from your IdP app registration |
 | `ALLOWED_EMAIL_DOMAINS` | Only users with these email domains can sign in |
 | `BEDROCK_REGION` | Region for Bedrock API calls |
+
+### CDK context variables
+
+The stack itself is parameterized by CDK context (`-c key=value`, or set them in
+`cdk.json` / `cdk.context.json`). The two-pass deploy exists because the ECS service
+needs the image to exist: pass 1 (`-c imageReady=false`) creates just the ECR repo,
+pass 2 (default) deploys the full stack.
+
+| Context | Pass | Required | Meaning |
+|---|---|---|---|
+| `region` | both | no | AWS region (default `CDK_DEFAULT_REGION` or `us-east-1`) |
+| `imageReady` | both | no | `false` = pass 1 (repo only); omit/`true` = pass 2 |
+| `publicUrl` | 2 | **yes** | Internal ALB https origin, e.g. `https://claude-gateway.example.com` |
+| `imageTag` | 2 | no | ECR tag (default = pinned claude version) |
+| `certArn` | 2 | no† | ACM cert ARN for `publicUrl`'s hostname (imported cert mode; omit for managed public-cert mode) |
+| `zoneName` | 2 | **yes** | Route 53 hosted-zone name, e.g. `example.com` |
+| `zoneId` | 2 | no | Hosted-zone id (looked up from `zoneName` if omitted) |
+| `ingressCidr` | 2 | **yes** | VPN/corp **client** CIDR developers connect from — **not** the VPC CIDR |
+| `vpcId` | 2 | no | Import an existing VPC instead of creating one |
+| `createVpcEndpoints` | 2 | no | Default `true`. Set `false` **only** when reusing a `vpcId` that already has the Bedrock/Secrets Manager/ECR/CloudWatch/S3 endpoints — AWS allows one private-DNS endpoint per service per VPC, so recreating them fails the deploy |
+| `publicZoneId` | 2 | no* | PUBLIC hosted-zone id — managed cert mode only (ACM DNS validation) |
+| `publicZoneName` | 2 | no* | PUBLIC hosted-zone name — managed cert mode only (explicit) |
+| `enableDashboard` | 2 | no | `"true"` to deploy the CloudWatch dashboard + alarms (default off) |
+| `dailyCostThresholdUsd` | 2 | no | Daily cost-alarm threshold in USD (dashboard mode) |
+| `alarmEmail` | 2 | no | Optional email for an SNS alarm subscription (dashboard mode) |
+
+\* Required when `certArn` is omitted (managed public-cert mode).
+† Supply `certArn` for imported cert mode; omit it (and set `publicZoneId` + `publicZoneName`) for managed public-cert mode.
 
 ## Before going to production
 
@@ -311,13 +428,13 @@ You should see the Cloud gateway screen. Press Enter, complete browser SSO, and 
 
 ## Cleanup
 
-Remove everything the stack created:
+Remove everything the stack created. Pass the **same `-c platform=`** you deployed with so CDK synthesizes the matching compute layer:
 
 ```bash
-npx cdk destroy
+npx cdk destroy -c platform=ecs      # or -c platform=eks
 ```
 
-This deletes the ECS service, ALB, RDS database, ECR repository, IAM roles, security groups, DNS record, and log group. The S3 bucket and CodeBuild project used for image builds (if created by `deploy.sh`) are separate and may need manual cleanup.
+This deletes the compute (ECS service or EKS cluster), ALB/Ingress, RDS database, ECR repository, IAM roles, security groups, DNS record, and log group. The S3 bucket and CodeBuild project used for image builds (if created by `deploy.sh`) are separate and may need manual cleanup. On EKS, deleting the Ingress tears the ALB down before the cluster, so allow ~10–15 min for the cluster delete to finish.
 
 ## Cost
 

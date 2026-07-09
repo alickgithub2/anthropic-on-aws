@@ -2,3 +2,13 @@ node_modules/
 dist/
 cdk.out/
 .env
+
+# Build artifacts staged before `docker build` — never committed.
+# The pinned native binary (staged by setup.sh / the CDK build step)…
+claude
+linux-x64/
+# …and the STAMPED config (the committed source is gateway.yaml.template;
+# stamp-config.sh renders gateway.yaml from it, with real per-deploy values).
+gateway.yaml
+manifest.json
+manifest.json.sig
